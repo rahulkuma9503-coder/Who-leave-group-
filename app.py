@@ -1,9 +1,7 @@
 from flask import Flask, request, jsonify
 import logging
 import os
-import asyncio
-from threading import Thread
-import time
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -14,38 +12,26 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Bot application will be imported after setup
-bot_application = None
+# Bot components
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-def initialize_bot():
-    """Initialize the bot application"""
-    global bot_application
+# Import and setup bot
+try:
+    from bot import updater, dispatcher
     
-    try:
-        from bot import application as bot_app
-        bot_application = bot_app
+    # Set webhook on startup
+    if WEBHOOK_URL and BOT_TOKEN:
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        updater.bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook set to: {webhook_url}")
+    else:
+        logger.warning("⚠️ WEBHOOK_URL or BOT_TOKEN not set, webhook not configured")
         
-        if bot_application:
-            logger.info("✅ Bot application imported successfully")
-            
-            # Set webhook if we have the URL
-            if WEBHOOK_URL and BOT_TOKEN:
-                try:
-                    webhook_url = f"{WEBHOOK_URL}/webhook"
-                    bot_application.bot.set_webhook(webhook_url)
-                    logger.info(f"✅ Webhook set to: {webhook_url}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to set webhook: {e}")
-        else:
-            logger.error("❌ Failed to import bot application")
-            
-    except Exception as e:
-        logger.error(f"❌ Error initializing bot: {e}")
-
-# Initialize bot when app starts
-initialize_bot()
+except Exception as e:
+    logger.error(f"❌ Failed to import bot: {e}")
+    updater = None
+    dispatcher = None
 
 @app.route('/')
 def home():
@@ -65,9 +51,8 @@ def health():
     status = {
         "status": "healthy",
         "service": "telegram-bot",
-        "bot_initialized": bot_application is not None,
-        "webhook_url": WEBHOOK_URL,
-        "timestamp": time.time()
+        "bot_initialized": updater is not None,
+        "webhook_url": WEBHOOK_URL
     }
     return jsonify(status)
 
@@ -75,15 +60,15 @@ def health():
 def webhook():
     """Handle incoming updates from Telegram"""
     try:
-        if bot_application is None:
-            logger.error("Bot application not initialized")
+        if updater is None:
+            logger.error("Bot updater not initialized")
             return 'Bot not initialized', 500
             
         # Get the update from Telegram
-        update_data = request.get_json()
+        update = request.get_json()
         
         # Process the update in a thread to avoid blocking
-        thread = Thread(target=process_update, args=(update_data,))
+        thread = threading.Thread(target=process_update, args=(update,))
         thread.start()
         
         return 'ok'
@@ -92,16 +77,11 @@ def webhook():
         logger.error(f"Error in webhook handler: {e}")
         return 'error', 500
 
-def process_update(update_data):
+def process_update(update):
     """Process update in a separate thread"""
     try:
-        # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Process the update
-        update = bot_application.update_queue.put(update_data)
-        
+        # Use the dispatcher to process the update
+        dispatcher.process_update(update)
     except Exception as e:
         logger.error(f"Error processing update: {e}")
 
@@ -109,14 +89,14 @@ def process_update(update_data):
 def set_webhook():
     """Set webhook endpoint"""
     try:
-        if bot_application is None:
+        if updater is None:
             return jsonify({"success": False, "error": "Bot not initialized"})
             
         if not WEBHOOK_URL:
             return jsonify({"success": False, "error": "WEBHOOK_URL not set"})
             
         webhook_url = f"{WEBHOOK_URL}/webhook"
-        result = bot_application.bot.set_webhook(webhook_url)
+        result = updater.bot.set_webhook(webhook_url)
         
         logger.info(f"Webhook set to: {webhook_url}")
         return jsonify({
@@ -134,10 +114,10 @@ def set_webhook():
 def delete_webhook():
     """Delete webhook endpoint"""
     try:
-        if bot_application is None:
+        if updater is None:
             return jsonify({"success": False, "error": "Bot not initialized"})
             
-        result = bot_application.bot.delete_webhook()
+        result = updater.bot.delete_webhook()
         return jsonify({"success": True, "result": result})
         
     except Exception as e:
@@ -148,10 +128,10 @@ def delete_webhook():
 def get_webhook_info():
     """Get current webhook info"""
     try:
-        if bot_application is None:
+        if updater is None:
             return jsonify({"success": False, "error": "Bot not initialized"})
             
-        info = bot_application.bot.get_webhook_info()
+        info = updater.bot.get_webhook_info()
         return jsonify({
             "success": True,
             "url": info.url,
@@ -163,20 +143,6 @@ def get_webhook_info():
         
     except Exception as e:
         logger.error(f"Error getting webhook info: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/restart_bot', methods=['GET'])
-def restart_bot():
-    """Restart bot initialization"""
-    try:
-        initialize_bot()
-        return jsonify({
-            "success": True,
-            "message": "Bot reinitialization triggered",
-            "bot_initialized": bot_application is not None
-        })
-    except Exception as e:
-        logger.error(f"Error restarting bot: {e}")
         return jsonify({"success": False, "error": str(e)})
 
 if __name__ == '__main__':
