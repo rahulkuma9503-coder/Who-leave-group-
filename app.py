@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import logging
 import os
-from bot import setup_bot_application
+from bot import setup_bot_application, bot_application
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Initialize bot application
-bot_app = setup_bot_application()
+setup_bot_application()
 
 @app.route('/')
 def home():
@@ -20,13 +20,15 @@ def home():
 def health():
     return jsonify({"status": "healthy", "service": "telegram-bot"})
 
-@app.route('/webhook/' + os.environ.get('BOT_TOKEN'), methods=['POST'])
+@app.route('/webhook/' + os.environ.get('BOT_TOKEN', ''), methods=['POST'])
 def webhook():
     """Handle incoming updates from Telegram"""
     try:
-        # Process the update
+        if bot_application is None:
+            return 'Bot not initialized', 500
+            
         update = request.get_json()
-        bot_app.update_queue.put(update)
+        bot_application.update_queue.put(update)
         return 'ok'
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
@@ -36,8 +38,11 @@ def webhook():
 def set_webhook():
     """Set webhook endpoint (run this once after deployment)"""
     try:
-        webhook_url = os.environ.get('WEBHOOK_URL') + '/' + os.environ.get('BOT_TOKEN')
-        result = bot_app.bot.set_webhook(webhook_url)
+        if bot_application is None:
+            return jsonify({"success": False, "error": "Bot not initialized"})
+            
+        webhook_url = os.environ.get('WEBHOOK_URL', '') + '/webhook/' + os.environ.get('BOT_TOKEN', '')
+        result = bot_application.bot.set_webhook(webhook_url)
         return jsonify({
             "success": True,
             "webhook_url": webhook_url,
@@ -51,7 +56,10 @@ def set_webhook():
 def delete_webhook():
     """Delete webhook endpoint (use this if you want to switch to polling)"""
     try:
-        result = bot_app.bot.delete_webhook()
+        if bot_application is None:
+            return jsonify({"success": False, "error": "Bot not initialized"})
+            
+        result = bot_application.bot.delete_webhook()
         return jsonify({"success": True, "result": result})
     except Exception as e:
         logger.error(f"Error deleting webhook: {e}")
