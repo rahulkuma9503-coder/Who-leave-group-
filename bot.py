@@ -2,15 +2,9 @@ import os
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List, Any
+from typing import Dict, List
 
-from telegram import (
-    Update, 
-    ChatPermissions, 
-    User, 
-    ChatMember, 
-    Message
-)
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,7 +13,6 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.constants import ParseMode
 
 # Configure logging
 logging.basicConfig(
@@ -28,51 +21,152 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global application instance
-bot_application = None
-
 # Configuration
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(','))) if os.environ.get('ADMIN_IDS') else []
-BAN_DURATION_HOURS = 1  # Ban users who leave within 1 hour
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+BAN_DURATION_HOURS = 1
 
-# In-memory storage
+# Validate required environment variables
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN environment variable is required!")
+    exit(1)
+
+if not ADMIN_IDS:
+    logger.warning("⚠️ ADMIN_IDS environment variable not set. Admin commands will not work.")
+
+if not WEBHOOK_URL:
+    logger.warning("⚠️ WEBHOOK_URL environment variable not set. Webhook mode may not work properly.")
+
+# Storage
 user_join_times = {}
 broadcast_data = {}
 active_chats = set()
 
-class UserTracker:
-    @staticmethod
-    async def track_user_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Track when users join the chat"""
+# Create application
+try:
+    application = Application.builder().token(BOT_TOKEN).build()
+    logger.info("✅ Bot application created successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to create bot application: {e}")
+    exit(1)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    try:
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        if chat:
+            active_chats.add(chat.id)
+            logger.info(f"Chat {chat.id} added to active chats")
+        
+        welcome_text = (
+            f"👋 Hello {user.first_name}!\n\n"
+            f"I'm a moderation bot that:\n"
+            f"• 🚫 Bans users who leave within {BAN_DURATION_HOURS} hour of joining\n"
+            f"• 📢 Supports broadcast messages\n\n"
+            f"Add me to your group/channel and make me admin to start moderating!\n\n"
+            f"Use /help to see all commands."
+        )
+        
+        await update.message.reply_text(welcome_text)
+        logger.info(f"Start command from user {user.id} in chat {chat.id if chat else 'unknown'}")
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    try:
+        help_text = """
+🤖 <b>Available Commands:</b>
+
+<b>For Everyone:</b>
+/start - Start the bot
+/help - Show this help message
+
+<b>For Admins:</b>
+/broadcast - Start broadcast message collection
+/send_broadcast - Send collected broadcast
+/cancel_broadcast - Cancel broadcast
+/stats - Show bot statistics
+
+📝 <b>Note:</b> Make sure I have admin permissions in your groups/channels for the auto-ban feature to work properly.
+        """
+        await update.message.reply_text(help_text, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Error in help command: {e}")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command"""
+    try:
+        user = update.effective_user
+        
+        # Check if user is admin
+        if user.id not in ADMIN_IDS:
+            await update.message.reply_text("❌ You are not authorized to use this command.")
+            logger.warning(f"Unauthorized stats access attempt by user {user.id}")
+            return
+        
+        stats_text = (
+            f"📊 <b>Bot Statistics:</b>\n\n"
+            f"• 👥 Tracked users: {len(user_join_times)}\n"
+            f"• 💬 Active chats: {len(active_chats)}\n"
+            f"• 📢 Active broadcasts: {len(broadcast_data)}\n"
+            f"• 🚫 Ban duration: {BAN_DURATION_HOURS} hour(s)\n"
+            f"• 👑 Admins: {len(ADMIN_IDS)}\n"
+            f"• 🤖 Bot: {'🟢 Online' if application else '🔴 Offline'}"
+        )
+        await update.message.reply_text(stats_text, parse_mode='HTML')
+        logger.info(f"Stats command executed by admin {user.id}")
+    except Exception as e:
+        logger.error(f"Error in stats command: {e}")
+
+async def track_user_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when users join the chat"""
+    try:
         if update.chat_member:
             chat = update.chat_member.chat
             user = update.chat_member.new_chat_member.user
             old_status = update.chat_member.old_chat_member.status
             new_status = update.chat_member.new_chat_member.status
             
-            # User joined
+            # User joined the chat
             if (old_status in ['left', 'kicked', 'restricted'] and 
                 new_status in ['member', 'administrator', 'creator']):
-                user_join_times[f"{chat.id}_{user.id}"] = {
+                
+                user_key = f"{chat.id}_{user.id}"
+                user_join_times[user_key] = {
                     'join_time': datetime.now(),
                     'user_id': user.id,
                     'chat_id': chat.id,
-                    'username': user.username or user.first_name
+                    'username': user.username or user.first_name,
+                    'chat_title': chat.title or 'Unknown Chat'
                 }
                 active_chats.add(chat.id)
-                logger.info(f"User {user.id} joined chat {chat.id} at {datetime.now()}")
+                
+                logger.info(f"User {user.id} (@{user.username}) joined chat {chat.id} ({chat.title}) at {datetime.now()}")
+                
+                # Send welcome message (optional)
+                try:
+                    welcome_msg = f"👋 Welcome @{user.username or user.first_name} to the group! Please read the rules."
+                    await context.bot.send_message(chat.id, welcome_msg)
+                except Exception as e:
+                    logger.warning(f"Could not send welcome message: {e}")
+                    
+    except Exception as e:
+        logger.error(f"Error tracking user join: {e}")
 
-    @staticmethod
-    async def track_user_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Track when users leave and ban if within 1 hour"""
+async def track_user_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when users leave and ban if within 1 hour"""
+    try:
         if update.chat_member:
             chat = update.chat_member.chat
             user = update.chat_member.new_chat_member.user
             old_status = update.chat_member.old_chat_member.status
             new_status = update.chat_member.new_chat_member.status
             
-            # User left or was removed
+            # User left or was kicked
             if (old_status in ['member', 'administrator', 'restricted'] and 
                 new_status in ['left', 'kicked']):
                 
@@ -83,7 +177,7 @@ class UserTracker:
                     join_time = user_data['join_time']
                     time_in_chat = datetime.now() - join_time
                     
-                    # If user left within 1 hour, ban them
+                    # Check if user left within the ban duration
                     if time_in_chat < timedelta(hours=BAN_DURATION_HOURS):
                         try:
                             # Ban the user
@@ -92,324 +186,334 @@ class UserTracker:
                                 user_id=user.id
                             )
                             
-                            # Send notification
-                            duration_hours = BAN_DURATION_HOURS
-                            message = (
-                                f"🚫 User @{user.username or user.first_name} has been banned!\n"
-                                f"Reason: Left the group within {duration_hours} hour of joining.\n"
-                                f"Join time: {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                                f"Time in chat: {str(time_in_chat).split('.')[0]}"
+                            # Send ban notification
+                            ban_message = (
+                                f"🚫 <b>User Banned</b>\n\n"
+                                f"• 👤 User: @{user.username or user.first_name}\n"
+                                f"• ⏱️ Joined: {join_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"• 🕒 Time in chat: {str(time_in_chat).split('.')[0]}\n"
+                                f"• 📝 Reason: Left within {BAN_DURATION_HOURS} hour of joining"
                             )
                             
                             await context.bot.send_message(
                                 chat_id=chat.id,
-                                text=message
+                                text=ban_message,
+                                parse_mode='HTML'
                             )
-                            logger.info(f"Banned user {user.id} for leaving within {BAN_DURATION_HOURS} hour")
                             
-                        except Exception as e:
-                            logger.error(f"Failed to ban user {user.id}: {e}")
+                            logger.info(f"Banned user {user.id} for leaving within {BAN_DURATION_HOURS} hour of joining")
+                            
+                        except Exception as ban_error:
+                            logger.error(f"Failed to ban user {user.id}: {ban_error}")
+                            # Try to send error message
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat.id,
+                                    text=f"❌ Could not ban user @{user.username or user.first_name}. Make sure I have admin permissions."
+                                )
+                            except:
+                                pass
                     
-                    # Remove from tracking
+                    # Remove user from tracking regardless of ban
                     user_join_times.pop(user_key, None)
+                    logger.info(f"User {user.id} left chat {chat.id}, removed from tracking")
+                    
+    except Exception as e:
+        logger.error(f"Error tracking user leave: {e}")
 
-class BroadcastHandler:
-    @staticmethod
-    async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start broadcast process"""
-        if update.effective_user.id not in ADMIN_IDS:
+# Broadcast functionality
+async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start broadcast message collection"""
+    try:
+        user = update.effective_user
+        
+        # Check if user is admin
+        if user.id not in ADMIN_IDS:
             await update.message.reply_text("❌ You are not authorized to use this command.")
             return
         
-        broadcast_data[update.effective_user.id] = {
-            'step': 'awaiting_message',
-            'messages': []
+        # Initialize broadcast data for this user
+        broadcast_data[user.id] = {
+            'messages': [],
+            'start_time': datetime.now()
         }
         
-        await update.message.reply_text(
-            "📢 Broadcast Mode Started!\n\n"
-            "Please send the message you want to broadcast. "
-            "You can send text, photos, videos, documents, or stickers.\n\n"
-            "When you're done adding messages, use /send_broadcast to send or /cancel_broadcast to cancel."
+        instructions = (
+            "📢 <b>Broadcast Mode Started!</b>\n\n"
+            "Now you can send me the messages you want to broadcast. I support:\n"
+            "• 📝 Text messages\n"
+            "• 🖼️ Photos with captions\n"
+            "• 🎥 Videos with captions\n"
+            "• 📎 Documents with captions\n"
+            "• 😀 Stickers\n\n"
+            "Send your messages one by one. When you're done, use:\n"
+            "• /send_broadcast - To send all collected messages\n"
+            "• /cancel_broadcast - To cancel and clear all messages\n\n"
+            "<i>Currently collected: 0 messages</i>"
         )
-
-    @staticmethod
-    async def collect_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Collect messages for broadcast"""
-        user_id = update.effective_user.id
         
-        if user_id not in broadcast_data or broadcast_data[user_id]['step'] != 'awaiting_message':
+        await update.message.reply_text(instructions, parse_mode='HTML')
+        logger.info(f"Broadcast mode started by admin {user.id}")
+        
+    except Exception as e:
+        logger.error(f"Error starting broadcast: {e}")
+
+async def collect_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect messages for broadcast"""
+    try:
+        user = update.effective_user
+        
+        # Check if user is in broadcast mode
+        if user.id not in broadcast_data:
             return
         
         message = update.message
-        
-        # Store message data based on type
         message_data = {
             'message_id': message.message_id,
-            'chat_id': message.chat_id,
-            'date': message.date.timestamp()
+            'date': message.date,
+            'chat_id': message.chat_id
         }
         
+        # Handle different message types
         if message.text:
             message_data.update({
                 'type': 'text',
-                'text': message.text,
-                'entities': message.entities,
-                'parse_mode': ParseMode.HTML
+                'content': message.text,
+                'entities': message.entities
             })
+            preview = f"📝 Text message: {message.text[:50]}{'...' if len(message.text) > 50 else ''}"
+            
         elif message.photo:
             message_data.update({
                 'type': 'photo',
-                'photo': message.photo[-1].file_id,
+                'file_id': message.photo[-1].file_id,  # Highest quality photo
                 'caption': message.caption,
                 'caption_entities': message.caption_entities
             })
+            preview = f"🖼️ Photo" + (f" with caption: {message.caption[:30]}..." if message.caption else "")
+            
         elif message.video:
             message_data.update({
                 'type': 'video',
-                'video': message.video.file_id,
+                'file_id': message.video.file_id,
                 'caption': message.caption,
                 'caption_entities': message.caption_entities
             })
+            preview = f"🎥 Video" + (f" with caption: {message.caption[:30]}..." if message.caption else "")
+            
         elif message.document:
             message_data.update({
                 'type': 'document',
-                'document': message.document.file_id,
+                'file_id': message.document.file_id,
                 'caption': message.caption,
                 'caption_entities': message.caption_entities
             })
+            preview = f"📎 Document" + (f" with caption: {message.caption[:30]}..." if message.caption else "")
+            
         elif message.sticker:
             message_data.update({
                 'type': 'sticker',
-                'sticker': message.sticker.file_id
+                'file_id': message.sticker.file_id
             })
+            preview = f"😀 Sticker"
+            
         else:
             await message.reply_text("❌ Unsupported message type. Please send text, photo, video, document, or sticker.")
             return
         
-        broadcast_data[user_id]['messages'].append(message_data)
+        # Add message to broadcast collection
+        broadcast_data[user.id]['messages'].append(message_data)
+        total_messages = len(broadcast_data[user.id]['messages'])
         
-        # Show preview and options
-        preview_text = "✅ Message added to broadcast!\n\n"
-        if message.text:
-            preview_text += f"Text: {message.text[:100]}{'...' if len(message.text) > 100 else ''}"
-        elif message.photo:
-            preview_text += "Type: Photo"
-        elif message.video:
-            preview_text += "Type: Video"
-        elif message.document:
-            preview_text += "Type: Document"
-        elif message.sticker:
-            preview_text += "Type: Sticker"
+        # Send confirmation
+        confirmation = (
+            f"✅ {preview}\n\n"
+            f"📊 <b>Total collected:</b> {total_messages} message(s)\n\n"
+            f"Send more messages or:\n"
+            f"• /send_broadcast - To send to all chats\n"
+            f"• /cancel_broadcast - To cancel"
+        )
         
-        preview_text += f"\n\nTotal messages in broadcast: {len(broadcast_data[user_id]['messages'])}"
-        preview_text += "\n\nSend more messages or use /send_broadcast to send or /cancel_broadcast to cancel."
+        await message.reply_text(confirmation, parse_mode='HTML')
+        logger.info(f"Broadcast message collected by admin {user.id}, total: {total_messages}")
         
-        await message.reply_text(preview_text)
+    except Exception as e:
+        logger.error(f"Error collecting broadcast message: {e}")
 
-    @staticmethod
-    async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send broadcast to all active chats"""
-        user_id = update.effective_user.id
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send broadcast to all active chats"""
+    try:
+        user = update.effective_user
         
-        if user_id not in ADMIN_IDS:
+        # Check if user is admin
+        if user.id not in ADMIN_IDS:
             await update.message.reply_text("❌ You are not authorized to use this command.")
             return
         
-        if user_id not in broadcast_data or not broadcast_data[user_id]['messages']:
-            await update.message.reply_text("❌ No messages to broadcast. Use /broadcast first.")
+        # Check if there are messages to broadcast
+        if user.id not in broadcast_data or not broadcast_data[user.id]['messages']:
+            await update.message.reply_text("❌ No messages to broadcast. Use /broadcast first to start collecting messages.")
             return
         
-        await update.message.reply_text("🔄 Starting broadcast... This may take a while.")
+        await update.message.reply_text("🔄 Starting broadcast... This may take a while depending on the number of chats.")
         
-        # Use active chats for broadcasting
+        messages = broadcast_data[user.id]['messages']
         chats = list(active_chats)
+        total_chats = len(chats)
+        total_messages = len(messages)
         
         if not chats:
-            await update.message.reply_text("❌ No active chats available for broadcasting.")
+            await update.message.reply_text("❌ No active chats found for broadcasting.")
             return
         
         success_count = 0
         fail_count = 0
-        total_messages = len(broadcast_data[user_id]['messages'])
         
-        for chat_id in chats:
+        # Send to each chat
+        for index, chat_id in enumerate(chats):
             try:
-                for message_data in broadcast_data[user_id]['messages']:
-                    if message_data['type'] == 'text':
+                # Send each message to this chat
+                for msg in messages:
+                    if msg['type'] == 'text':
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=message_data['text'],
-                            entities=message_data.get('entities'),
-                            parse_mode=message_data.get('parse_mode')
+                            text=msg['content'],
+                            entities=msg.get('entities'),
+                            parse_mode='HTML'
                         )
-                    elif message_data['type'] == 'photo':
+                    elif msg['type'] == 'photo':
                         await context.bot.send_photo(
                             chat_id=chat_id,
-                            photo=message_data['photo'],
-                            caption=message_data.get('caption'),
-                            caption_entities=message_data.get('caption_entities')
+                            photo=msg['file_id'],
+                            caption=msg.get('caption'),
+                            caption_entities=msg.get('caption_entities'),
+                            parse_mode='HTML'
                         )
-                    elif message_data['type'] == 'video':
+                    elif msg['type'] == 'video':
                         await context.bot.send_video(
                             chat_id=chat_id,
-                            video=message_data['video'],
-                            caption=message_data.get('caption'),
-                            caption_entities=message_data.get('caption_entities')
+                            video=msg['file_id'],
+                            caption=msg.get('caption'),
+                            caption_entities=msg.get('caption_entities'),
+                            parse_mode='HTML'
                         )
-                    elif message_data['type'] == 'document':
+                    elif msg['type'] == 'document':
                         await context.bot.send_document(
                             chat_id=chat_id,
-                            document=message_data['document'],
-                            caption=message_data.get('caption'),
-                            caption_entities=message_data.get('caption_entities')
+                            document=msg['file_id'],
+                            caption=msg.get('caption'),
+                            caption_entities=msg.get('caption_entities'),
+                            parse_mode='HTML'
                         )
-                    elif message_data['type'] == 'sticker':
+                    elif msg['type'] == 'sticker':
                         await context.bot.send_sticker(
                             chat_id=chat_id,
-                            sticker=message_data['sticker']
+                            sticker=msg['file_id']
                         )
                 
                 success_count += 1
+                logger.info(f"Broadcast sent to chat {chat_id} ({success_count}/{total_chats})")
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"Failed to send broadcast to chat {chat_id}: {e}")
                 fail_count += 1
-            
-            # Small delay to avoid rate limits
-            await asyncio.sleep(0.1)
+                logger.error(f"Failed to send broadcast to chat {chat_id}: {e}")
         
-        # Cleanup
-        message_count = len(broadcast_data[user_id]['messages'])
-        broadcast_data.pop(user_id, None)
+        # Clean up broadcast data
+        message_count = len(broadcast_data[user.id]['messages'])
+        broadcast_data.pop(user.id, None)
         
-        await update.message.reply_text(
-            f"📊 Broadcast Completed!\n\n"
-            f"✅ Successful chats: {success_count}\n"
-            f"❌ Failed chats: {fail_count}\n"
-            f"📝 Total messages sent: {success_count * total_messages}"
+        # Send final report
+        report = (
+            f"📊 <b>Broadcast Completed!</b>\n\n"
+            f"✅ <b>Successful:</b> {success_count} chats\n"
+            f"❌ <b>Failed:</b> {fail_count} chats\n"
+            f"📝 <b>Messages sent:</b> {message_count} per chat\n"
+            f"📨 <b>Total deliveries:</b> {success_count * message_count}\n"
+            f"⏱️ <b>Active chats:</b> {total_chats}"
         )
-
-    @staticmethod
-    async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel broadcast process"""
-        user_id = update.effective_user.id
         
-        if user_id in broadcast_data:
-            message_count = len(broadcast_data[user_id]['messages'])
-            broadcast_data.pop(user_id)
-            await update.message.reply_text(f"❌ Broadcast cancelled. {message_count} messages were not sent.")
+        await update.message.reply_text(report, parse_mode='HTML')
+        logger.info(f"Broadcast completed by admin {user.id}. Success: {success_count}, Failed: {fail_count}")
+        
+    except Exception as e:
+        logger.error(f"Error sending broadcast: {e}")
+
+async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the broadcast process"""
+    try:
+        user = update.effective_user
+        
+        if user.id in broadcast_data:
+            message_count = len(broadcast_data[user.id]['messages'])
+            broadcast_data.pop(user.id)
+            
+            await update.message.reply_text(
+                f"❌ Broadcast cancelled.\n"
+                f"🗑️ {message_count} message(s) were not sent."
+            )
+            logger.info(f"Broadcast cancelled by admin {user.id}, {message_count} messages discarded")
         else:
             await update.message.reply_text("No active broadcast to cancel.")
-
-class AdminCommands:
-    @staticmethod
-    async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show bot statistics"""
-        if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ You are not authorized to use this command.")
-            return
-        
-        stats_text = (
-            f"🤖 Bot Statistics\n\n"
-            f"📊 Tracked users: {len(user_join_times)}\n"
-            f"👥 Active chats: {len(active_chats)}\n"
-            f"📢 Active broadcasts: {len(broadcast_data)}\n"
-            f"🕒 Ban duration: {BAN_DURATION_HOURS} hour(s)\n"
-            f"👑 Admins: {len(ADMIN_IDS)}"
-        )
-        
-        await update.message.reply_text(stats_text)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /start is issued."""
-    user = update.effective_user
-    # Track this chat
-    if update.effective_chat:
-        active_chats.add(update.effective_chat.id)
-    
-    await update.message.reply_text(
-        f"👋 Hello {user.first_name}!\n\n"
-        f"I'm a moderation bot that:\n"
-        f"• 🚫 Bans users who leave within {BAN_DURATION_HOURS} hour of joining\n"
-        f"• 📢 Supports broadcast messages\n\n"
-        f"Add me to your group/channel and make me admin to start moderating!"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /help is issued."""
-    help_text = """
-🤖 Available Commands:
-
-For Everyone:
-/start - Start the bot
-/help - Show this help message
-
-For Admins:
-/broadcast - Start broadcast message
-/send_broadcast - Send collected broadcast
-/cancel_broadcast - Cancel broadcast
-/stats - Show bot statistics
-
-📝 Note: Make sure the bot has admin permissions in your groups/channels for the auto-ban feature to work.
-    """
-    await update.message.reply_text(help_text)
+            
+    except Exception as e:
+        logger.error(f"Error cancelling broadcast: {e}")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors and handle them gracefully."""
+    """Handle errors in the telegram bot"""
     logger.error(f"Exception while handling an update: {context.error}")
-
-def setup_bot_application():
-    """Set up and return the bot application"""
-    global bot_application
-    
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable is required!")
-        return None
     
     try:
-        # Create Application with simpler configuration
-        bot_application = Application.builder().token(BOT_TOKEN).build()
+        # Notify admin about the error
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"❌ Bot Error:\n{context.error}"
+                )
+            except:
+                pass
+    except:
+        pass
 
-        # Add handlers
-        bot_application.add_handler(CommandHandler("start", start))
-        bot_application.add_handler(CommandHandler("help", help_command))
-        bot_application.add_handler(CommandHandler("stats", AdminCommands.stats))
+# Setup all handlers
+def setup_handlers():
+    """Setup all telegram bot handlers"""
+    try:
+        # Basic commands
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("stats", stats))
         
         # Broadcast commands
-        bot_application.add_handler(CommandHandler("broadcast", BroadcastHandler.start_broadcast))
-        bot_application.add_handler(CommandHandler("send_broadcast", BroadcastHandler.send_broadcast))
-        bot_application.add_handler(CommandHandler("cancel_broadcast", BroadcastHandler.cancel_broadcast))
+        application.add_handler(CommandHandler("broadcast", start_broadcast))
+        application.add_handler(CommandHandler("send_broadcast", send_broadcast))
+        application.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast))
         
-        # Message handler for collecting broadcast messages
-        bot_application.add_handler(MessageHandler(
-            filters.ALL & ~filters.COMMAND, 
-            BroadcastHandler.collect_broadcast_message
+        # Message handler for collecting broadcast messages (must be after command handlers)
+        application.add_handler(MessageHandler(
+            filters.ALL & ~filters.COMMAND,
+            collect_broadcast_message
         ))
         
         # Chat member handlers for tracking joins/leaves
-        bot_application.add_handler(ChatMemberHandler(
-            UserTracker.track_user_join, 
-            ChatMemberHandler.CHAT_MEMBER
-        ))
-        bot_application.add_handler(ChatMemberHandler(
-            UserTracker.track_user_leave, 
-            ChatMemberHandler.CHAT_MEMBER
-        ))
-
+        application.add_handler(ChatMemberHandler(track_user_join, ChatMemberHandler.CHAT_MEMBER))
+        application.add_handler(ChatMemberHandler(track_user_leave, ChatMemberHandler.CHAT_MEMBER))
+        
         # Error handler
-        bot_application.add_error_handler(error_handler)
-
-        logger.info("Bot application setup completed successfully")
-        return bot_application
+        application.add_error_handler(error_handler)
+        
+        logger.info("✅ All bot handlers setup successfully")
         
     except Exception as e:
-        logger.error(f"Failed to setup bot application: {e}")
-        return None
+        logger.error(f"❌ Failed to setup bot handlers: {e}")
 
-# For local development with polling
+# Initialize the bot
+setup_handlers()
+
+# For local testing with polling
 if __name__ == '__main__':
-    application = setup_bot_application()
-    if application:
-        logger.info("Starting bot in polling mode...")
-        application.run_polling()
+    logger.info("Starting bot in polling mode...")
+    application.run_polling()
