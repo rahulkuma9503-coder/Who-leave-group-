@@ -1,27 +1,21 @@
 import os
 import logging
-import time
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
-import json
-import asyncio
 
 from telegram import (
     Update, 
     ChatPermissions, 
     User, 
     ChatMember, 
-    Message,
-    InputMediaPhoto,
-    InputMediaVideo,
-    InputMediaDocument
+    Message
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ChatMemberHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters
 )
@@ -34,15 +28,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global application instance
+bot_application = None
+
 # Configuration
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(','))) if os.environ.get('ADMIN_IDS') else []
 BAN_DURATION_HOURS = 1  # Ban users who leave within 1 hour
 
-# In-memory storage (for production, use a database)
+# In-memory storage
 user_join_times = {}
 broadcast_data = {}
-active_chats = set()  # Track chats where bot is active
+active_chats = set()
 
 class UserTracker:
     @staticmethod
@@ -234,6 +231,7 @@ class BroadcastHandler:
         
         success_count = 0
         fail_count = 0
+        total_messages = len(broadcast_data[user_id]['messages'])
         
         for chat_id in chats:
             try:
@@ -282,13 +280,14 @@ class BroadcastHandler:
             await asyncio.sleep(0.1)
         
         # Cleanup
+        message_count = len(broadcast_data[user_id]['messages'])
         broadcast_data.pop(user_id, None)
         
         await update.message.reply_text(
             f"📊 Broadcast Completed!\n\n"
-            f"✅ Successful: {success_count}\n"
-            f"❌ Failed: {fail_count}\n"
-            f"📝 Total messages sent: {success_count * len(broadcast_data.get(user_id, {}).get('messages', []))}"
+            f"✅ Successful chats: {success_count}\n"
+            f"❌ Failed chats: {fail_count}\n"
+            f"📝 Total messages sent: {success_count * total_messages}"
         )
 
     @staticmethod
@@ -362,46 +361,55 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def setup_bot_application():
     """Set up and return the bot application"""
+    global bot_application
+    
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is required!")
         return None
     
-    # Create Application
-    application = Application.builder().token(BOT_TOKEN).build()
+    try:
+        # Create Application with simpler configuration
+        bot_application = Application.builder().token(BOT_TOKEN).build()
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", AdminCommands.stats))
-    
-    # Broadcast commands
-    application.add_handler(CommandHandler("broadcast", BroadcastHandler.start_broadcast))
-    application.add_handler(CommandHandler("send_broadcast", BroadcastHandler.send_broadcast))
-    application.add_handler(CommandHandler("cancel_broadcast", BroadcastHandler.cancel_broadcast))
-    
-    # Message handler for collecting broadcast messages
-    application.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND, 
-        BroadcastHandler.collect_broadcast_message
-    ))
-    
-    # Chat member handlers for tracking joins/leaves
-    application.add_handler(ChatMemberHandler(
-        UserTracker.track_user_join, 
-        ChatMemberHandler.CHAT_MEMBER
-    ))
-    application.add_handler(ChatMemberHandler(
-        UserTracker.track_user_leave, 
-        ChatMemberHandler.CHAT_MEMBER
-    ))
+        # Add handlers
+        bot_application.add_handler(CommandHandler("start", start))
+        bot_application.add_handler(CommandHandler("help", help_command))
+        bot_application.add_handler(CommandHandler("stats", AdminCommands.stats))
+        
+        # Broadcast commands
+        bot_application.add_handler(CommandHandler("broadcast", BroadcastHandler.start_broadcast))
+        bot_application.add_handler(CommandHandler("send_broadcast", BroadcastHandler.send_broadcast))
+        bot_application.add_handler(CommandHandler("cancel_broadcast", BroadcastHandler.cancel_broadcast))
+        
+        # Message handler for collecting broadcast messages
+        bot_application.add_handler(MessageHandler(
+            filters.ALL & ~filters.COMMAND, 
+            BroadcastHandler.collect_broadcast_message
+        ))
+        
+        # Chat member handlers for tracking joins/leaves
+        bot_application.add_handler(ChatMemberHandler(
+            UserTracker.track_user_join, 
+            ChatMemberHandler.CHAT_MEMBER
+        ))
+        bot_application.add_handler(ChatMemberHandler(
+            UserTracker.track_user_leave, 
+            ChatMemberHandler.CHAT_MEMBER
+        ))
 
-    # Error handler
-    application.add_error_handler(error_handler)
+        # Error handler
+        bot_application.add_error_handler(error_handler)
 
-    return application
+        logger.info("Bot application setup completed successfully")
+        return bot_application
+        
+    except Exception as e:
+        logger.error(f"Failed to setup bot application: {e}")
+        return None
 
 # For local development with polling
 if __name__ == '__main__':
     application = setup_bot_application()
     if application:
+        logger.info("Starting bot in polling mode...")
         application.run_polling()
