@@ -24,32 +24,30 @@ logger = logging.getLogger(__name__)
 # Configuration
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '').split(','))) if os.environ.get('ADMIN_IDS') else []
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 BAN_DURATION_HOURS = 1
 
 # Validate required environment variables
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN environment variable is required!")
-    exit(1)
-
-if not ADMIN_IDS:
-    logger.warning("⚠️ ADMIN_IDS environment variable not set. Admin commands will not work.")
-
-if not WEBHOOK_URL:
-    logger.warning("⚠️ WEBHOOK_URL environment variable not set. Webhook mode may not work properly.")
+    # Don't exit, just log the error so Flask can still start
+    application = None
+else:
+    try:
+        # Create application
+        application = Application.builder().token(BOT_TOKEN).build()
+        logger.info("✅ Bot application created successfully")
+        
+        if not ADMIN_IDS:
+            logger.warning("⚠️ ADMIN_IDS environment variable not set. Admin commands will not work.")
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to create bot application: {e}")
+        application = None
 
 # Storage
 user_join_times = {}
 broadcast_data = {}
 active_chats = set()
-
-# Create application
-try:
-    application = Application.builder().token(BOT_TOKEN).build()
-    logger.info("✅ Bot application created successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to create bot application: {e}")
-    exit(1)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -147,13 +145,6 @@ async def track_user_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 logger.info(f"User {user.id} (@{user.username}) joined chat {chat.id} ({chat.title}) at {datetime.now()}")
                 
-                # Send welcome message (optional)
-                try:
-                    welcome_msg = f"👋 Welcome @{user.username or user.first_name} to the group! Please read the rules."
-                    await context.bot.send_message(chat.id, welcome_msg)
-                except Exception as e:
-                    logger.warning(f"Could not send welcome message: {e}")
-                    
     except Exception as e:
         logger.error(f"Error tracking user join: {e}")
 
@@ -481,6 +472,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Setup all handlers
 def setup_handlers():
     """Setup all telegram bot handlers"""
+    if application is None:
+        logger.error("Cannot setup handlers - application is None")
+        return
+        
     try:
         # Basic commands
         application.add_handler(CommandHandler("start", start))
@@ -510,10 +505,8 @@ def setup_handlers():
     except Exception as e:
         logger.error(f"❌ Failed to setup bot handlers: {e}")
 
-# Initialize the bot
-setup_handlers()
-
-# For local testing with polling
-if __name__ == '__main__':
-    logger.info("Starting bot in polling mode...")
-    application.run_polling()
+# Initialize the bot handlers
+if application:
+    setup_handlers()
+else:
+    logger.error("❌ Bot application is None - handlers not setup")
