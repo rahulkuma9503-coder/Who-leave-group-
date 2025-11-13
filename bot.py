@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 import json
+import asyncio
 
 from telegram import (
     Update, 
@@ -41,6 +42,7 @@ BAN_DURATION_HOURS = 1  # Ban users who leave within 1 hour
 # In-memory storage (for production, use a database)
 user_join_times = {}
 broadcast_data = {}
+active_chats = set()  # Track chats where bot is active
 
 class UserTracker:
     @staticmethod
@@ -61,6 +63,7 @@ class UserTracker:
                     'chat_id': chat.id,
                     'username': user.username or user.first_name
                 }
+                active_chats.add(chat.id)
                 logger.info(f"User {user.id} joined chat {chat.id} at {datetime.now()}")
 
     @staticmethod
@@ -209,7 +212,7 @@ class BroadcastHandler:
 
     @staticmethod
     async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send broadcast to all chats"""
+        """Send broadcast to all active chats"""
         user_id = update.effective_user.id
         
         if user_id not in ADMIN_IDS:
@@ -222,12 +225,11 @@ class BroadcastHandler:
         
         await update.message.reply_text("🔄 Starting broadcast... This may take a while.")
         
-        # Get all chats where bot is member (you might want to maintain a database of chats)
-        # For now, we'll use a simple approach - you need to maintain chat list
-        chats = []  # You should implement a way to store chat IDs
+        # Use active chats for broadcasting
+        chats = list(active_chats)
         
         if not chats:
-            await update.message.reply_text("❌ No chats available for broadcasting.")
+            await update.message.reply_text("❌ No active chats available for broadcasting.")
             return
         
         success_count = 0
@@ -295,8 +297,9 @@ class BroadcastHandler:
         user_id = update.effective_user.id
         
         if user_id in broadcast_data:
+            message_count = len(broadcast_data[user_id]['messages'])
             broadcast_data.pop(user_id)
-            await update.message.reply_text("❌ Broadcast cancelled.")
+            await update.message.reply_text(f"❌ Broadcast cancelled. {message_count} messages were not sent.")
         else:
             await update.message.reply_text("No active broadcast to cancel.")
 
@@ -311,7 +314,8 @@ class AdminCommands:
         stats_text = (
             f"🤖 Bot Statistics\n\n"
             f"📊 Tracked users: {len(user_join_times)}\n"
-            f"👥 Active broadcasts: {len(broadcast_data)}\n"
+            f"👥 Active chats: {len(active_chats)}\n"
+            f"📢 Active broadcasts: {len(broadcast_data)}\n"
             f"🕒 Ban duration: {BAN_DURATION_HOURS} hour(s)\n"
             f"👑 Admins: {len(ADMIN_IDS)}"
         )
@@ -321,6 +325,10 @@ class AdminCommands:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     user = update.effective_user
+    # Track this chat
+    if update.effective_chat:
+        active_chats.add(update.effective_chat.id)
+    
     await update.message.reply_text(
         f"👋 Hello {user.first_name}!\n\n"
         f"I'm a moderation bot that:\n"
@@ -352,11 +360,11 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors and handle them gracefully."""
     logger.error(f"Exception while handling an update: {context.error}")
 
-def main():
-    """Start the bot."""
+def setup_bot_application():
+    """Set up and return the bot application"""
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is required!")
-        return
+        return None
     
     # Create Application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -390,26 +398,10 @@ def main():
     # Error handler
     application.add_error_handler(error_handler)
 
-    # Start the Bot
-    if os.environ.get('RENDER'):
-        # Webhook for Render
-        port = int(os.environ.get('PORT', 8443))
-        webhook_url = os.environ.get('WEBHOOK_URL')
-        
-        if webhook_url:
-            application.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=BOT_TOKEN,
-                webhook_url=f"{webhook_url}/{BOT_TOKEN}"
-            )
-        else:
-            logger.warning("WEBHOOK_URL not set, using polling instead")
-            application.run_polling()
-    else:
-        # Polling for local development
-        application.run_polling()
+    return application
 
+# For local development with polling
 if __name__ == '__main__':
-    import asyncio
-    main()
+    application = setup_bot_application()
+    if application:
+        application.run_polling()
